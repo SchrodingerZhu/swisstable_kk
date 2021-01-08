@@ -1,7 +1,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
-#include <xmmintrin.h>
 
 #if defined(__GNUC__) || defined(__clang__)
 #  define PURE __attribute__((const))
@@ -25,6 +24,7 @@
 
 #ifdef __SSE2__
 
+#include <xmmintrin.h>
 #define BITMASK_STRIDE 0x1u
 #define BITMASK_MASK   0xffffu
 
