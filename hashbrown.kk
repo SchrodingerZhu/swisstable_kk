@@ -4,23 +4,28 @@ include extern {
   c  file "hashbrown.c"
 }
 
-type hashtable<a>;
+type hashtable :: (H, V) -> V;
 
-effect hashable<a> {
-  fun hash( x : a ) : size_t
-}
-
-extern create-int-tablex(h: a -> size_t): hashtable<int> {
+extern create-int-table: forall<h> (hasher: box<int> -> size_t) -> hashtable<h, int> {
+  // use box<a> as it is transparent as kk_box_t
   c inline "htable_with_hasher(#1, kk_context())"
 }
 
-extern simple(x: a): size_t {
-  c inline "0"
+fun int-table(): ndet hashtable<h, int>  {
+  val s = next-state();
+  create-int-table(fn(x) { s.single(x.unbox) })
 }
 
-fun test-table(): hashtable<int>  {
-  val k = 1;
-  create-int-tablex(fn(x) {k.size_t})
+extern list: forall<h, a> (table: hashtable<h, a>) -> read<h> list<a> {
+  c inline "kk_htable_to_list(#1, kk_context())"
 }
 
+extern insert-boxed-int: forall<h, a> (table: hashtable<h, a>, value: box<int>) -> write<h> ()  {
+  c inline "kk_htable_insert(#1, #2, kk_context())"
+}
+
+fun insert(table: hashtable<h, a>, x: int): write<h> hashtable<h, a> {
+  insert-boxed-int(table, Box(x))
+  table
+}
 

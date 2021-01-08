@@ -935,7 +935,7 @@ create_hasher(kk_ahash__random_state state, kk_context_t* _ctx)
   return kk_datatype_from_ptr(&hasher->_base._block);
 }
 
-static kk_integer_t
+static size_t
 kk_hasher_finish(kk_ahash__hasher hasher, kk_context_t* _ctx)
 {
   /// TODO: it is better to return uint64, but Koka current do no have this type
@@ -949,7 +949,7 @@ kk_hasher_finish(kk_ahash__hasher hasher, kk_context_t* _ctx)
   {
     kk_ahash__hasher_decref(hasher, _ctx);
   }
-  return kk_integer_from_uint64(res, _ctx);
+  return res;
 }
 
 /// FIXME: this is a dirty hack

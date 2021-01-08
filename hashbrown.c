@@ -1,11 +1,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
-
+#include <stdio.h>
 #if defined(__GNUC__) || defined(__clang__)
-#  define PURE __attribute__((const))
-#  define FAST_PATH inline __attribute__((always_inline, hot))
-#  define COLD_PATH __attribute__((noinline, cold))
+#  define PURE //__attribute__((const))
+#  define FAST_PATH //inline __attribute__((always_inline, hot))
+#  define COLD_PATH //__attribute__((noinline, cold))
 #  define likely(x) __builtin_expect(!!(x), 1)
 #  define unlikely(x) __builtin_expect(!!(x), 0)
 #elif defined(_MSC_VER)
@@ -34,15 +34,15 @@
 typedef uint16_t bitmask_t;
 typedef __m128i  group_t; 
 
-static FAST_PATH group_t load(const void * __restrict__ ptr) {
+static FAST_PATH group_t load(const void * ptr) {
   return _mm_loadu_si128((const group_t*)ptr);
 }
 
-static FAST_PATH group_t load_aligned(const void * __restrict__ ptr) {
+static FAST_PATH group_t load_aligned(const void * ptr) {
   return _mm_load_si128((const group_t*)ptr);
 }
 
-static FAST_PATH void store_aligned(group_t group, void * __restrict__ ptr) {
+static FAST_PATH void store_aligned(group_t group, void * ptr) {
   return _mm_store_si128((group_t*)ptr, group);
 }
 
@@ -137,17 +137,17 @@ static FAST_PATH PURE group_t little_endian(group_t group) {
   }
 }
 
-static FAST_PATH group_t load(const void * __restrict__ ptr) {
+static FAST_PATH group_t load(const void * ptr) {
   group_t group;
   memcpy(&group, ptr, sizeof(group));
   return group;
 }
 
-static FAST_PATH group_t load_aligned(const void * __restrict__ ptr) {
+static FAST_PATH group_t load_aligned(const void * ptr) {
   return *(const group_t*)ptr;
 }
 
-static FAST_PATH void store_aligned(group_t group, void * __restrict__ ptr) {
+static FAST_PATH void store_aligned(group_t group, void * ptr) {
   *(group_t*)ptr = group;
 }
 
@@ -248,7 +248,7 @@ static FAST_PATH PURE size_t h1(uint64_t hash) {
 }
 
 static FAST_PATH PURE uint8_t h2(uint64_t hash) {
-    const static size_t HASH_LEN = 
+    static const size_t HASH_LEN = 
         sizeof(size_t) < sizeof(uint64_t) ? sizeof(size_t) : sizeof(uint64_t);
     return (hash >> (HASH_LEN * 8 - 7)) & 0x7f;
 }
@@ -509,9 +509,9 @@ static FAST_PATH void clear(table_t* table, kk_context_t* ctx) {
 //        for 32bit machines
 #define apply_hash(h, data, ctx) \
   kk_function_call(size_t, \
-  (kk_box_t, kk_context_t*), \
-  h, \
-  (data, ctx))
+  (kk_function_t, kk_box_t, kk_context_t*), \
+  kk_function_dup(h), \
+  (h, data, ctx))
 
 static FAST_PATH void 
 resize(table_t* table, size_t capacity, kk_context_t* ctx) {
@@ -631,6 +631,7 @@ insert(table_t* table, uint64_t hash, kk_box_t value, kk_context_t* ctx) {
   uint8_t old_ctrl = table->ctrl[idx];
   if (unlikely(table->growth_left == 0 && special_is_empty(old_ctrl))) {
     reserve(table, 1, ctx);
+    idx = find_insert_slot(table, hash);
   }
   kk_box_t* bkt = bucket(table, idx);
   table->growth_left -= special_is_empty(old_ctrl);
@@ -650,4 +651,33 @@ static kk_hashbrown__hashtable htable_with_hasher(kk_function_t hasher, kk_conte
     kk_block_alloc_as(kk_hashtable_t, 0, 0, ctx);
   htable->table = new_table(hasher);
   return kk_datatype_from_ptr(&htable->_base._block);
+}
+
+static kk_std_core__list kk_htable_to_list(kk_hashbrown__hashtable htable, kk_context_t* ctx) {
+  table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
+  table_iter_t iter = table_iterator(table);
+  kk_box_t* item = next_table_item(&iter);
+  kk_std_core__list nil  = kk_std_core__new_Nil(ctx);
+  struct kk_std_core_Cons* cons = NULL;
+  kk_std_core__list list = kk_std_core__new_Nil(ctx);
+  while (item) {
+    kk_std_core__list hd = kk_std_core__new_Cons(kk_reuse_null,kk_box_dup(*item), nil, ctx);
+    if (cons==NULL) {
+      list = hd;
+    } else {
+      cons->tail = hd;
+    }
+    item = next_table_item(&iter);
+  }
+  kk_hashbrown__hashtable_drop(htable,ctx);
+  return list;
+}
+
+static kk_unit_t
+kk_htable_insert(kk_hashbrown__hashtable htable, kk_std_core_types__box data, kk_context_t* ctx) {
+  table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
+  kk_box_t value = kk_box_dup(data.unbox);
+  size_t hash = apply_hash(table->hasher, value, ctx);
+  insert(table, hash, value, ctx);
+  return kk_Unit;
 }

@@ -26,7 +26,7 @@ extern hasher(state: random-state) : hasher {
   c inline "create_hasher((#1), kk_context())"
 }
 
-extern finish(h: hasher) : int {
+extern finish(h: hasher) : size_t {
   c inline "kk_hasher_finish((#1), kk_context())"
 }
 
@@ -90,35 +90,35 @@ fun write(h: hasher, x: list<char>) : hasher {
   x.foldl(h, write)
 }
 
-fun single(state: random-state, x: int) : int {
+fun single(state: random-state, x: int) : size_t {
   state.hasher.write(x).finish
 }
 
-fun single(state: random-state, x: string) : int {
+fun single(state: random-state, x: string) : size_t {
   state.hasher.write(x).finish
 }
 
-fun single(state: random-state, x: int32) : int {
+fun single(state: random-state, x: int32) : size_t {
   state.hasher.write(x).finish
 }
 
-fun single(state: random-state, x: int16) : int {
+fun single(state: random-state, x: int16) : size_t {
   state.hasher.write(x).finish
 }
 
-fun single(state: random-state, x: int8) : int {
+fun single(state: random-state, x: int8) : size_t {
   state.hasher.write(x).finish
 }
 
-fun single(state: random-state, x: uint8) : int {
+fun single(state: random-state, x: uint8) : size_t {
   state.hasher.write(x).finish
 }
 
-fun single(state: random-state, x: size_t) : int {
+fun single(state: random-state, x: size_t) : size_t {
   state.hasher.write(x).finish
 }
 
-fun single(state: random-state, x: char) : int {
+fun single(state: random-state, x: char) : size_t {
   state.hasher.write(x).finish
 }
 
