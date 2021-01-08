@@ -4,17 +4,20 @@
 
 #if defined(__GNUC__) || defined(__clang__)
 #  define PURE __attribute__((const))
-#  define FAST_PATH inline __attribute__((always_inline))
+#  define FAST_PATH inline __attribute__((always_inline, hot))
+#  define COLD_PATH __attribute__((noinline, cold))
 #  define likely(x) __builtin_expect(!!(x), 1)
 #  define unlikely(x) __builtin_expect(!!(x), 0)
 #elif defined(_MSC_VER)
 #  define PURE 
 #  define FAST_PATH inline __forceinline
+#  define COLD_PATH __declspec(noinline)
 #  define likely(x) !!(x)
 #  define unlikely(x) !!(x)
 #else
 #  define PURE
 #  define FAST_PATH inline
+#  define COLD_PATH 
 #  define likely(x) !!(x)
 #  define unlikely(x) !!(x)
 #endif 
@@ -304,6 +307,7 @@ typedef struct table_s {
   uint8_t *ctrl;
   size_t growth_left;
   size_t items;
+  kk_function_t hasher;
 } table_t;
 
 static FAST_PATH size_t num_ctrl_bytes(table_t* table) {
@@ -311,17 +315,18 @@ static FAST_PATH size_t num_ctrl_bytes(table_t* table) {
 }
 
 static FAST_PATH PURE table_t
-new_table() {
+new_table(kk_function_t hasher) {
   table_t table;
   table.ctrl        = static_empty_grp();
   table.bucket_mask = 0;
   table.items       = 0;
   table.growth_left = 0;
+  table.hasher      = hasher;
   return table;
 }
 
 static FAST_PATH table_t
-new_table_uninitialized(size_t buckets, kk_context_t* ctx) {
+new_table_uninitialized(size_t buckets, kk_function_t hasher, kk_context_t* ctx) {
   table_t result;
   size_t offset, alignment;
   size_t size = calculate_layout(buckets, &offset, &alignment);
@@ -331,16 +336,17 @@ new_table_uninitialized(size_t buckets, kk_context_t* ctx) {
   result.ctrl = ctrl;
   result.growth_left = bucket_mask_to_capacity(buckets - 1);
   result.items = 0;
+  result.hasher = hasher;
   return result;
 }
 
 static FAST_PATH table_t
-new_table_with_capacity(size_t capacity, kk_context_t* ctx) {
+new_table_with_capacity(size_t capacity, kk_function_t hasher, kk_context_t* ctx) {
   if (capacity == 0) {
-    return new_table();
+    return new_table(hasher);
   } else {
     size_t buckets = capacity_to_buckets(capacity);
-    table_t result = new_table_uninitialized(buckets, ctx);
+    table_t result = new_table_uninitialized(buckets, hasher, ctx);
     memset(result.ctrl, EMPTY, num_ctrl_bytes(&result));
     return result;
   }
@@ -496,4 +502,152 @@ static FAST_PATH void clear(table_t* table, kk_context_t* ctx) {
     bucket = next_table_item(&iter);
   }
   clear_no_drop(table);
+}
+
+// FIXME: currently Koka do not have a good uint64 support
+//        use size_t instead for now; this will be problematic
+//        for 32bit machines
+#define apply_hash(h, data, ctx) \
+  kk_function_call(size_t, \
+  (kk_box_t, kk_context_t*), \
+  h, \
+  (data, ctx))
+
+static FAST_PATH void 
+resize(table_t* table, size_t capacity, kk_context_t* ctx) {
+  table_t new_table = new_table_with_capacity(capacity, table->hasher, ctx);
+  new_table.growth_left -= table->items;
+  new_table.items = table->items;
+
+  table_iter_t iter = table_iterator(table);
+  kk_box_t* item = next_table_item(&iter);
+  while (item) {
+    uint64_t hash_value = apply_hash(table->hasher, *item, ctx);
+    size_t index = find_insert_slot(&new_table, hash_value);
+    set_ctrl(&new_table, index, h2(hash_value));
+    *bucket(&new_table, index) = *item;
+    item = next_table_item(&iter);
+  }
+  if (!is_empty_singleton(table)) {
+    free_buckets(table);
+  }
+  *table = new_table;
+}
+
+static FAST_PATH void 
+shrink_to(table_t* table, size_t min_size, kk_context_t* ctx) {
+  min_size = min_size < table->items ? table->items : min_size;
+  if (min_size == 0) {
+    *table = new_table(table->hasher);
+    return;
+  }
+
+  size_t min_buckets = capacity_to_buckets(min_size);
+
+  if (min_buckets < buckets(table)) {
+    if (table->items == 0) {
+      *table = new_table_with_capacity(min_size, table->hasher, ctx);
+    } else {
+      resize(table, min_size, ctx);
+    }
+  }
+}
+
+#define probe_index(idx) \
+  (((idx - probe_seq(table, hash).pos) & table->bucket_mask) / sizeof(group_t))
+
+static FAST_PATH void rehash_in_place(table_t* table, kk_context_t* ctx) {
+  for (size_t i = 0, end = buckets(table); i < end; i += sizeof(group_t)) {
+    group_t group = 
+      convert_special_to_empty_and_full_to_deleted(load_aligned(table->ctrl + i));
+    store_aligned(group, table->ctrl + i);
+  }
+  size_t bkts = buckets(table);
+  if (bkts < sizeof(group_t)) {
+    memmove(table->ctrl + sizeof(group_t), table->ctrl, bkts);
+  } else {
+    memmove(table->ctrl + bkts, table->ctrl, sizeof(group_t));
+  }
+  
+  for (size_t i = 0; i < bkts; ++i) {
+    if (table->ctrl[i] != DELETED) {
+      continue;
+    }
+    while (true) {
+      kk_box_t* item = bucket(table, i);
+      uint64_t hash = apply_hash(table->hasher, *item, ctx);
+      size_t new_idx = find_insert_slot(table, hash);
+      uint8_t prev_ctrl = table->ctrl[new_idx];
+
+      if (likely(probe_index(i) == probe_index(new_idx))) {
+        set_ctrl(table, i, h2(hash));
+        goto rehash_outer_loop;
+      }
+
+      set_ctrl(table, new_idx, h2(hash));
+      
+      if (prev_ctrl == EMPTY) {
+        set_ctrl(table, i, EMPTY);
+        *bucket(table, new_idx) = *item;
+        goto rehash_outer_loop;
+      } else {
+        kk_box_t tmp;
+        tmp = *item;
+        *item = *bucket(table, new_idx);
+        *bucket(table, new_idx) = tmp;
+      }
+    }
+    rehash_outer_loop: continue;
+  }
+
+  table->growth_left = bucket_mask_to_capacity(table->bucket_mask) - table->items;
+}
+
+static COLD_PATH 
+void reserve_rehash(table_t* table, size_t additional, kk_context_t* ctx) {
+  size_t new_items = table->items + additional;
+  size_t full_capacity = bucket_mask_to_capacity(table->bucket_mask);
+  if (new_items <= full_capacity / 2) {
+    rehash_in_place(table, ctx);
+  } else {
+    resize(
+      table, 
+      new_items > full_capacity + 1 ? new_items : full_capacity + 1,
+      ctx
+    );
+  }
+}
+
+static FAST_PATH
+void reserve(table_t* table, size_t additional, kk_context_t* ctx) {
+  if (additional > table->growth_left) {
+    reserve_rehash(table, additional, ctx);
+  }
+}
+
+static FAST_PATH kk_box_t*
+insert(table_t* table, uint64_t hash, kk_box_t value, kk_context_t* ctx) {
+  size_t idx = find_insert_slot(table, hash);
+  uint8_t old_ctrl = table->ctrl[idx];
+  if (unlikely(table->growth_left == 0 && special_is_empty(old_ctrl))) {
+    reserve(table, 1, ctx);
+  }
+  kk_box_t* bkt = bucket(table, idx);
+  table->growth_left -= special_is_empty(old_ctrl);
+  set_ctrl(table, idx, h2(hash));
+  *bkt = value;
+  table->items += 1;
+  return bkt;
+}
+
+typedef struct kk_hashtable_s {
+  struct kk_hashbrown__hashtable_s _base;
+  table_t table;
+} kk_hashtable_t;
+
+static kk_hashbrown__hashtable htable_with_hasher(kk_function_t hasher, kk_context_t* ctx) {
+  kk_hashtable_t* htable =
+    kk_block_alloc_as(kk_hashtable_t, 0, 0, ctx);
+  htable->table = new_table(hasher);
+  return kk_datatype_from_ptr(&htable->_base._block);
 }
