@@ -725,17 +725,25 @@ table_remove(table_t* table, uint64_t hash, kk_box_t key, kk_context_t* ctx) {
   return result != NULL;
 }
 
-
-
 typedef struct kk_hashtable_s {
   struct kk_hashbrown__hashtable_s _base;
+  kk_free_fun_t* free;
+  kk_context_t* ctx; 
   table_t table;
 } kk_hashtable_t;
 
+static void kk_htable_free(void* ctx, kk_block_t* htable) {
+  table_t *table = &((kk_hashtable_t*)htable)->table;
+  clear(table, (kk_context_t*)ctx);
+  free_buckets(table);
+}
+
 static kk_hashbrown__hashtable htable_create(kk_function_t hasher, kk_function_t comparator, kk_context_t* ctx) {
   kk_hashtable_t* htable =
-    kk_block_alloc_as(kk_hashtable_t, 0, 0, ctx);
+    kk_block_alloc_as(kk_hashtable_t, 0, KK_TAG_CPTR_RAW, ctx);
   htable->table = new_table(hasher, comparator);
+  htable->ctx = ctx; // TODO: maybe Koka can allow passing ctx to raw free path?
+  htable->free = kk_htable_free;
   return kk_datatype_from_ptr(&htable->_base._block);
 }
 
@@ -758,6 +766,7 @@ kk_htable_insert(kk_hashbrown__hashtable htable, kk_std_core_types__box data, kk
   table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
   size_t hash = apply_hash(table->hasher, data.unbox, ctx);
   insert(table, hash, data.unbox, ctx);
+  kk_hashbrown__hashtable_drop(htable,ctx);
   return kk_Unit;
 }
 
@@ -765,32 +774,41 @@ static bool
 kk_htable_contains(kk_hashbrown__hashtable htable, kk_std_core_types__box key, kk_context_t* ctx) {
   table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
   size_t hash = apply_hash(table->hasher, key.unbox, ctx);
-  return table_find(table, hash, key.unbox, ctx) != NULL;
+  bool flag = table_find(table, hash, key.unbox, ctx);
+  kk_hashbrown__hashtable_drop(htable,ctx);
+  return flag;
 }
 
 static bool
 kk_htable_remove(kk_hashbrown__hashtable htable, kk_std_core_types__box key, kk_context_t* ctx) {
   table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
   size_t hash = apply_hash(table->hasher, key.unbox, ctx);
-  return table_remove(table, hash, key.unbox, ctx);
+  bool flag = table_remove(table, hash, key.unbox, ctx);
+  kk_hashbrown__hashtable_drop(htable,ctx);
+  return flag;
 }
 
 static kk_integer_t
 kk_htable_size(kk_hashbrown__hashtable htable, kk_context_t* ctx) {
   table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
-  return kk_integer_from_uint64(table->items, ctx);
+  kk_integer_t res = kk_integer_from_uint64(table->items, ctx);
+  kk_hashbrown__hashtable_drop(htable,ctx);
+  return res;
 }
 
 static kk_integer_t
 kk_htable_capacity(kk_hashbrown__hashtable htable, kk_context_t* ctx) {
   table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
-  return kk_integer_from_uint64(table->items + table->growth_left, ctx);
+  kk_integer_t res = kk_integer_from_uint64(table->items + table->growth_left, ctx);
+  kk_hashbrown__hashtable_drop(htable,ctx);
+  return res;
 }
 
 static kk_unit_t
 kk_htable_shrink(kk_hashbrown__hashtable htable, size_t size, kk_context_t* ctx) {
   table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
   shrink_to(table, size, ctx);
+  kk_hashbrown__hashtable_drop(htable,ctx);
   return kk_Unit;
 }
 
@@ -798,8 +816,11 @@ static kk_unit_t
 kk_htable_clear(kk_hashbrown__hashtable htable, kk_context_t* ctx) {
   table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
   clear(table, ctx);
+  kk_hashbrown__hashtable_drop(htable,ctx);
   return kk_Unit;
 }
+
+
 
 
 /// NOTICE:
