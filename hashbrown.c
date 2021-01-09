@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
+
 #if defined(__GNUC__) || defined(__clang__)
 #  define PURE //__attribute__((const))
 #  define FAST_PATH //inline __attribute__((always_inline, hot))
@@ -223,9 +224,9 @@ static FAST_PATH PURE size_t leading_zeros(bitmask_t mask) {
 # endif
 }
 
-typedef bitmask_t mask_iter_t;
+typedef bitmask_t bitmask_iter_t;
 
-static FAST_PATH size_t next(mask_iter_t* iter) {
+static FAST_PATH size_t next_mask(bitmask_iter_t* iter) {
     size_t bit = lowest_set_bit(*iter);
     *iter = remove_lowest_bit(*iter);
     return bit;
@@ -308,6 +309,7 @@ typedef struct table_s {
   size_t growth_left;
   size_t items;
   kk_function_t hasher;
+  kk_function_t comparator;
 } table_t;
 
 static FAST_PATH size_t num_ctrl_bytes(table_t* table) {
@@ -315,18 +317,19 @@ static FAST_PATH size_t num_ctrl_bytes(table_t* table) {
 }
 
 static FAST_PATH PURE table_t
-new_table(kk_function_t hasher) {
+new_table(kk_function_t hasher, kk_function_t comparator) {
   table_t table;
   table.ctrl        = static_empty_grp();
   table.bucket_mask = 0;
   table.items       = 0;
   table.growth_left = 0;
   table.hasher      = hasher;
+  table.comparator  = comparator;
   return table;
 }
 
 static FAST_PATH table_t
-new_table_uninitialized(size_t buckets, kk_function_t hasher, kk_context_t* ctx) {
+new_table_uninitialized(size_t buckets, kk_function_t hasher, kk_function_t comparator, kk_context_t* ctx) {
   table_t result;
   size_t offset, alignment;
   size_t size = calculate_layout(buckets, &offset, &alignment);
@@ -337,16 +340,17 @@ new_table_uninitialized(size_t buckets, kk_function_t hasher, kk_context_t* ctx)
   result.growth_left = bucket_mask_to_capacity(buckets - 1);
   result.items = 0;
   result.hasher = hasher;
+  result.comparator = comparator;
   return result;
 }
 
 static FAST_PATH table_t
-new_table_with_capacity(size_t capacity, kk_function_t hasher, kk_context_t* ctx) {
+new_table_with_capacity(size_t capacity, kk_function_t hasher, kk_function_t comparator, kk_context_t* ctx) {
   if (capacity == 0) {
-    return new_table(hasher);
+    return new_table(hasher, comparator);
   } else {
     size_t buckets = capacity_to_buckets(capacity);
-    table_t result = new_table_uninitialized(buckets, hasher, ctx);
+    table_t result = new_table_uninitialized(buckets, hasher, comparator, ctx);
     memset(result.ctrl, EMPTY, num_ctrl_bytes(&result));
     return result;
   }
@@ -357,7 +361,7 @@ static FAST_PATH PURE kk_box_t* bucket_from_baseidx(kk_box_t* base, size_t index
 }
 
 static FAST_PATH PURE size_t bucket_to_baseidx(kk_box_t* bucket, kk_box_t* base) {
-  return bucket - base;
+  return base - bucket;
 }
 
 static FAST_PATH PURE size_t buckets(table_t* table) {
@@ -384,6 +388,16 @@ static FAST_PATH kk_box_t* data_start(table_t* table) {
   return data_end(table) - buckets(table);
 }
 
+typedef kk_box_t* bucket_t;
+
+static FAST_PATH kk_box_t read_bucket(bucket_t b) {
+  return *(b - 1);
+}
+
+static FAST_PATH void write_bucket(bucket_t b, kk_box_t value) {
+  *(b - 1) = value;
+}
+
 static FAST_PATH kk_box_t* bucket(table_t* table, size_t index) {
   return bucket_from_baseidx(data_end(table), index);
 }
@@ -398,7 +412,7 @@ static FAST_PATH void set_ctrl(table_t* table, size_t index, uint8_t ctrl) {
   table->ctrl[index2] = ctrl;
 }
 
-static FAST_PATH void erase(table_t* table, kk_box_t* item, kk_context_t* ctx) {
+static FAST_PATH void erase(table_t* table, bucket_t item, kk_context_t* ctx) {
   size_t index = bucket_index(table, item);
   size_t index_before = (index - sizeof(group_t)) & table->bucket_mask;
   bitmask_t empty_before = match_empty(load(table->ctrl + index_before));
@@ -412,7 +426,7 @@ static FAST_PATH void erase(table_t* table, kk_box_t* item, kk_context_t* ctx) {
   };
   set_ctrl(table, index, ctrl);
   table->items--;
-  kk_box_drop(*item, ctx);
+  kk_box_drop(read_bucket(item), ctx);
 }
 
 static FAST_PATH probe_seq_t probe_seq(table_t* table, uint64_t hash) {
@@ -513,19 +527,25 @@ static FAST_PATH void clear(table_t* table, kk_context_t* ctx) {
   kk_function_dup(h), \
   (h, data, ctx))
 
+#define apply_cmp(h, a, b, ctx) \
+  kk_function_call(bool, \
+  (kk_function_t, kk_box_t, kk_box_t, kk_context_t*), \
+  kk_function_dup(h), \
+  (h, a, b, ctx))
+
 static FAST_PATH void 
 resize(table_t* table, size_t capacity, kk_context_t* ctx) {
-  table_t new_table = new_table_with_capacity(capacity, table->hasher, ctx);
+  table_t new_table = new_table_with_capacity(capacity, table->hasher, table->comparator, ctx);
   new_table.growth_left -= table->items;
   new_table.items = table->items;
 
   table_iter_t iter = table_iterator(table);
-  kk_box_t* item = next_table_item(&iter);
+  bucket_t item = next_table_item(&iter);
   while (item) {
-    uint64_t hash_value = apply_hash(table->hasher, *item, ctx);
+    uint64_t hash_value = apply_hash(table->hasher, read_bucket(item), ctx);
     size_t index = find_insert_slot(&new_table, hash_value);
     set_ctrl(&new_table, index, h2(hash_value));
-    *bucket(&new_table, index) = *item;
+    write_bucket(bucket(&new_table, index), read_bucket(item));
     item = next_table_item(&iter);
   }
   if (!is_empty_singleton(table)) {
@@ -538,7 +558,7 @@ static FAST_PATH void
 shrink_to(table_t* table, size_t min_size, kk_context_t* ctx) {
   min_size = min_size < table->items ? table->items : min_size;
   if (min_size == 0) {
-    *table = new_table(table->hasher);
+    *table = new_table(table->hasher, table->comparator);
     return;
   }
 
@@ -546,7 +566,7 @@ shrink_to(table_t* table, size_t min_size, kk_context_t* ctx) {
 
   if (min_buckets < buckets(table)) {
     if (table->items == 0) {
-      *table = new_table_with_capacity(min_size, table->hasher, ctx);
+      *table = new_table_with_capacity(min_size, table->hasher, table->comparator, ctx);
     } else {
       resize(table, min_size, ctx);
     }
@@ -574,8 +594,8 @@ static FAST_PATH void rehash_in_place(table_t* table, kk_context_t* ctx) {
       continue;
     }
     while (true) {
-      kk_box_t* item = bucket(table, i);
-      uint64_t hash = apply_hash(table->hasher, *item, ctx);
+      bucket_t item = bucket(table, i);
+      uint64_t hash = apply_hash(table->hasher, read_bucket(item), ctx);
       size_t new_idx = find_insert_slot(table, hash);
       uint8_t prev_ctrl = table->ctrl[new_idx];
 
@@ -588,13 +608,13 @@ static FAST_PATH void rehash_in_place(table_t* table, kk_context_t* ctx) {
       
       if (prev_ctrl == EMPTY) {
         set_ctrl(table, i, EMPTY);
-        *bucket(table, new_idx) = *item;
+        write_bucket(bucket(table, new_idx), read_bucket(item));
         goto rehash_outer_loop;
       } else {
         kk_box_t tmp;
-        tmp = *item;
-        *item = *bucket(table, new_idx);
-        *bucket(table, new_idx) = tmp;
+        tmp = read_bucket(item);
+        write_bucket(item, read_bucket(bucket(table, new_idx)));
+        write_bucket(bucket(table, new_idx), tmp);
       }
     }
     rehash_outer_loop: continue;
@@ -625,7 +645,7 @@ void reserve(table_t* table, size_t additional, kk_context_t* ctx) {
   }
 }
 
-static FAST_PATH kk_box_t*
+static FAST_PATH bucket_t
 insert(table_t* table, uint64_t hash, kk_box_t value, kk_context_t* ctx) {
   size_t idx = find_insert_slot(table, hash);
   uint8_t old_ctrl = table->ctrl[idx];
@@ -633,41 +653,101 @@ insert(table_t* table, uint64_t hash, kk_box_t value, kk_context_t* ctx) {
     reserve(table, 1, ctx);
     idx = find_insert_slot(table, hash);
   }
-  kk_box_t* bkt = bucket(table, idx);
+  bucket_t bkt = bucket(table, idx);
   table->growth_left -= special_is_empty(old_ctrl);
   set_ctrl(table, idx, h2(hash));
-  *bkt = value;
+  write_bucket(bkt, value);
   table->items += 1;
   return bkt;
 }
+
+static FAST_PATH void
+replace_bucket(bucket_t bucket, kk_box_t value, kk_context_t* ctx) {
+  kk_box_drop(read_bucket(bucket), ctx);
+  write_bucket(bucket, value);
+}
+
+typedef struct table_iterhash_s {
+  table_t * table;
+  uint8_t h2_hash;
+  probe_seq_t probe_seq;
+  group_t group;
+  bitmask_iter_t bitmask;
+} table_iterhash_t;
+
+static FAST_PATH table_iterhash_t 
+new_table_iterhash(table_t* table, uint64_t hash) {
+  table_iterhash_t iter;
+  iter.table = table;
+  iter.h2_hash = h2(hash);
+  iter.probe_seq = probe_seq(table, hash);
+  iter.group = load(table->ctrl + iter.probe_seq.pos);
+  iter.bitmask = match_byte(iter.group, iter.h2_hash);
+  return iter;
+}
+
+static FAST_PATH bucket_t 
+iterhash_next(table_iterhash_t* iter) {
+  while (true) {
+    size_t bit = next_mask(&iter->bitmask);
+    if (bit != (size_t)-1) {
+      size_t index = (iter->probe_seq.pos + bit) & iter->table->bucket_mask;
+      return bucket(iter->table, index);
+    }
+    if (likely(any_bit_set(match_empty(iter->group)))) {
+      return NULL;
+    }
+    move_next(&iter->probe_seq, iter->table->bucket_mask);
+    iter->group = load(iter->table->ctrl + iter->probe_seq.pos);
+    iter->bitmask = match_byte(iter->group, iter->h2_hash);
+  }
+}
+
+static FAST_PATH bucket_t 
+table_find(table_t* table, uint64_t hash, kk_box_t key, kk_context_t* ctx) {
+  table_iterhash_t iter = new_table_iterhash(table, hash);
+  bucket_t item = iterhash_next(&iter);
+  while (item) {
+    if (likely(apply_cmp(table->comparator, key, read_bucket(item), ctx))) {
+      return item;
+    }
+    item = iterhash_next(&iter);
+  }
+  return NULL;
+}
+
+static FAST_PATH bool 
+table_remove(table_t* table, uint64_t hash, kk_box_t key, kk_context_t* ctx) {
+  bucket_t result = table_find(table, hash, key, ctx);
+  if (result) {
+    erase(table, result, ctx);
+  }
+  return result != NULL;
+}
+
+
 
 typedef struct kk_hashtable_s {
   struct kk_hashbrown__hashtable_s _base;
   table_t table;
 } kk_hashtable_t;
 
-static kk_hashbrown__hashtable htable_with_hasher(kk_function_t hasher, kk_context_t* ctx) {
+static kk_hashbrown__hashtable htable_create(kk_function_t hasher, kk_function_t comparator, kk_context_t* ctx) {
   kk_hashtable_t* htable =
     kk_block_alloc_as(kk_hashtable_t, 0, 0, ctx);
-  htable->table = new_table(hasher);
+  htable->table = new_table(hasher, comparator);
   return kk_datatype_from_ptr(&htable->_base._block);
 }
 
 static kk_std_core__list kk_htable_to_list(kk_hashbrown__hashtable htable, kk_context_t* ctx) {
   table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
   table_iter_t iter = table_iterator(table);
-  kk_box_t* item = next_table_item(&iter);
-  kk_std_core__list nil  = kk_std_core__new_Nil(ctx);
-  struct kk_std_core_Cons* cons = NULL;
+  bucket_t item = next_table_item(&iter);
   kk_std_core__list list = kk_std_core__new_Nil(ctx);
   while (item) {
-    kk_std_core__list hd = kk_std_core__new_Cons(kk_reuse_null,kk_box_dup(*item), nil, ctx);
-    if (cons==NULL) {
-      list = hd;
-    } else {
-      cons->tail = hd;
-    }
+    kk_std_core__list hd = kk_std_core__new_Cons(kk_reuse_null,kk_box_dup(read_bucket(item)), list, ctx);
     item = next_table_item(&iter);
+    list = hd;
   }
   kk_hashbrown__hashtable_drop(htable,ctx);
   return list;
@@ -676,8 +756,27 @@ static kk_std_core__list kk_htable_to_list(kk_hashbrown__hashtable htable, kk_co
 static kk_unit_t
 kk_htable_insert(kk_hashbrown__hashtable htable, kk_std_core_types__box data, kk_context_t* ctx) {
   table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
-  kk_box_t value = kk_box_dup(data.unbox);
-  size_t hash = apply_hash(table->hasher, value, ctx);
-  insert(table, hash, value, ctx);
+  size_t hash = apply_hash(table->hasher, data.unbox, ctx);
+  insert(table, hash, data.unbox, ctx);
   return kk_Unit;
 }
+
+static bool
+kk_htable_contains(kk_hashbrown__hashtable htable, kk_std_core_types__box key, kk_context_t* ctx) {
+  table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
+  size_t hash = apply_hash(table->hasher, key.unbox, ctx);
+  return table_find(table, hash, key.unbox, ctx) != NULL;
+}
+
+static bool
+kk_htable_remove(kk_hashbrown__hashtable htable, kk_std_core_types__box key, kk_context_t* ctx) {
+  table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
+  size_t hash = apply_hash(table->hasher, key.unbox, ctx);
+  return table_remove(table, hash, key.unbox, ctx);
+}
+
+
+/// NOTICE:
+/// - boxes are dupped when insertion is determined
+/// - boxes are dropped when erasure happened in inner structures
+/// - therefore, in the interfaces, we should not dup/drop any box
