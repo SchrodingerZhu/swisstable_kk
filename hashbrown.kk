@@ -63,8 +63,33 @@ extern remove-boxed(table: hashtable<h, a>, x: box<a>): <read<h>, write<h>> bool
   c inline "kk_htable_remove(#1, #2, kk_context())"
 }
 
+extern size(table: hashtable<h, a>): read<h> int {
+  c inline "kk_htable_size(#1, kk_context())"
+}
+
+extern capacity(table: hashtable<h, a>): read<h> int {
+  c inline "kk_htable_capacity(#1, kk_context())"
+}
+
+extern clearx(table: hashtable<h, a>): write<h> () {
+  c inline "kk_htable_clear(#1, kk_context())"
+}
+
+extern shrinkx(table: hashtable<h, a>, min_size: size_t): write<h> () {
+  c inline "kk_htable_shrink(#1, #2, kk_context())"
+}
+
 fun remove(table: hashtable<h, a>, x: a): <read<h>, write<h>> (hashtable<h, a>, bool) {
   val res = remove-boxed(table, Box(x))
   (table, res)
 }
 
+fun shrink(table: hashtable<h, a>, min_size: int): write<h> hashtable<h, a> {
+  shrinkx(table, min_size.size_t);
+  table
+}
+
+fun clear(table: hashtable<h, a>): write<h> hashtable<h, a> {
+  clearx(table);
+  table
+}

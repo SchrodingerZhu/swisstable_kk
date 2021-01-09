@@ -510,9 +510,9 @@ static FAST_PATH table_iter_t table_iterator(table_t* table) {
 
 static FAST_PATH void clear(table_t* table, kk_context_t* ctx) {
   table_iter_t iter = table_iterator(table);
-  kk_box_t* bucket = next_table_item(&iter);
+  bucket_t bucket = next_table_item(&iter);
   while (bucket) {
-    kk_box_drop(*bucket, ctx);
+    kk_box_drop(read_bucket(bucket), ctx);
     bucket = next_table_item(&iter);
   }
   clear_no_drop(table);
@@ -773,6 +773,32 @@ kk_htable_remove(kk_hashbrown__hashtable htable, kk_std_core_types__box key, kk_
   table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
   size_t hash = apply_hash(table->hasher, key.unbox, ctx);
   return table_remove(table, hash, key.unbox, ctx);
+}
+
+static kk_integer_t
+kk_htable_size(kk_hashbrown__hashtable htable, kk_context_t* ctx) {
+  table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
+  return kk_integer_from_uint64(table->items, ctx);
+}
+
+static kk_integer_t
+kk_htable_capacity(kk_hashbrown__hashtable htable, kk_context_t* ctx) {
+  table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
+  return kk_integer_from_uint64(table->items + table->growth_left, ctx);
+}
+
+static kk_unit_t
+kk_htable_shrink(kk_hashbrown__hashtable htable, size_t size, kk_context_t* ctx) {
+  table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
+  shrink_to(table, size, ctx);
+  return kk_Unit;
+}
+
+static kk_unit_t
+kk_htable_clear(kk_hashbrown__hashtable htable, kk_context_t* ctx) {
+  table_t *table = &((kk_hashtable_t*)(htable.ptr))->table;
+  clear(table, ctx);
+  return kk_Unit;
 }
 
 
